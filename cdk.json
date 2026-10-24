@@ -1,0 +1,8 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "extractor": "textract",
+    "enableSearch": false,
+    "ephemeral": false
+  }
+}
