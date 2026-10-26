@@ -16,3 +16,6 @@ extend-exclude = ["cdk.out"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true

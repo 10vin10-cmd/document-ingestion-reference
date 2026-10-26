@@ -46,6 +46,45 @@ def test_redelivered_record_does_not_duplicate_audit(aws):
     assert count == 1
 
 
+def _audit_entries(aws):
+    return aws["ddb"].Table("audit").query(
+        KeyConditionExpression="document_id = :d",
+        ExpressionAttributeValues={":d": "d1"})["Items"]
+
+
+def test_review_decision_records_reviewer_and_corrections(aws):
+    base = {"sk": "META", "document_id": "d1"}
+    corrections = {"TOTAL": {"previous": "1,200", "corrected": "1,250.00"}}
+    stream_processor.handler({"Records": [_record(
+        "5",
+        {**base, "status": "PENDING_REVIEW", "version": 6, "claimed_by": "asha"},
+        {**base, "status": "VALIDATED", "version": 7, "reviewed_by": "asha",
+         "review_corrections": corrections},
+    )]}, None)
+    entry = _audit_entries(aws)[0]
+    assert entry["actor"] == "asha"
+    assert entry["action"] == "review_decision"
+    assert entry["corrections"] == corrections
+
+
+def test_claims_are_audited(aws):
+    base = {"sk": "META", "document_id": "d1", "status": "PENDING_REVIEW"}
+    stream_processor.handler({"Records": [
+        _record("6", {**base, "version": 6}, {**base, "version": 7, "claimed_by": "ravi"}),
+        _record("7", {**base, "version": 7, "claimed_by": "ravi"}, {**base, "version": 8}),
+    ]}, None)
+    assert [(e["action"], e["actor"]) for e in _audit_entries(aws)] == [
+        ("claim", "ravi"), ("release", "ravi")]
+
+
+def test_system_steps_have_no_actor(aws):
+    base = {"sk": "META", "document_id": "d1"}
+    stream_processor.handler({"Records": [_record(
+        "8", {**base, "status": "SCANNED", "version": 3},
+        {**base, "status": "EXTRACTED", "version": 4})]}, None)
+    assert "actor" not in _audit_entries(aws)[0]
+
+
 def test_bad_record_is_reported_individually(aws):
     good = _record("1", None, {"sk": "META", "document_id": "d1", "status": "X",
                                 "version": 1}, "INSERT")

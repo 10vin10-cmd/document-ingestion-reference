@@ -16,7 +16,7 @@ from decimal import Decimal
 
 from common import aws
 from common.repository import InvalidTransition
-from common.states import TERMINAL, Status
+from common.states import REVIEW_ATTRS, TERMINAL, Status
 from common.templates import get_template
 from common.validation import assess
 
@@ -147,6 +147,8 @@ def request_review(event, _context):
         set_attrs={
             "review_task_token": event["task_token"],
             "review_issues": event.get("issues", []),
+            # Puts the document into the sparse review-queue index.
+            "review_queue": item["business_queue"],
         },
     )
     return {"parked": True}
@@ -189,7 +191,7 @@ def mark_failed(event, _context):
                 "error": str(error.get("Error", "Unknown"))[:256],
                 "cause": str(error.get("Cause", ""))[:1024],
             }
-        })
+        }, remove_attrs=REVIEW_ATTRS)  # e.g. review timed out: leave the queue
     except InvalidTransition:
         log.warning("%s reached a terminal state concurrently", doc_id)
     return {**event}

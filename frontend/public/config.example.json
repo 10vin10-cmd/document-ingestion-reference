@@ -1,0 +1,7 @@
+{
+  "region": "ap-south-1",
+  "userPoolId": "ap-south-1_XXXXXXXXX",
+  "userPoolClientId": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "authDomain": "https://your-prefix.auth.ap-south-1.amazoncognito.com",
+  "apiBaseUrl": ""
+}

@@ -47,7 +47,7 @@ def _process(record: dict) -> None:
     if not current or current.get("sk") != "META":
         return
 
-    _audit().put_item(Item={
+    entry = {
         "document_id": current["document_id"],
         # Sequence numbers are unique and ordered within a shard, which makes
         # retried writes idempotent and keeps entries in order.
@@ -57,11 +57,31 @@ def _process(record: dict) -> None:
         "to_status": (new or {}).get("status"),
         "version": (new or old).get("version"),
         "changed_at": current.get("updated_at"),
-    })
+    }
+    actor = _actor(old or {}, new or {})
+    if actor:
+        entry.update(actor)
+    _audit().put_item(Item=entry)
 
     endpoint = os.environ.get("SEARCH_ENDPOINT")
     if endpoint and new:
         _index(endpoint, {k: new[k] for k in SEARCHABLE if k in new})
+
+
+def _actor(old: dict, new: dict) -> dict | None:
+    """Name the person behind a human action. System steps have no actor."""
+    if old.get("status") == "PENDING_REVIEW" and new.get("status") in ("VALIDATED", "REJECTED"):
+        out = {"actor": new.get("reviewed_by"), "action": "review_decision"}
+        if new.get("review_corrections"):
+            out["corrections"] = new["review_corrections"]
+        if new.get("review_reason"):
+            out["reason"] = new["review_reason"]
+        return out
+    if old.get("status") == new.get("status") and old.get("claimed_by") != new.get("claimed_by"):
+        if new.get("claimed_by"):
+            return {"actor": new["claimed_by"], "action": "claim"}
+        return {"actor": old.get("claimed_by"), "action": "release"}
+    return None
 
 
 def _audit():

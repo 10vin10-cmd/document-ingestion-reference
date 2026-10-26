@@ -1,11 +1,11 @@
 """End-to-end through the handlers, with Step Functions replaced by direct
 calls in the order the state machine makes them."""
 
-import json
 
 import boto3
+from conftest import api_event
 
-from handlers import on_object_created, submit_review, workflow
+from handlers import on_object_created, reviews, workflow
 
 PDF = b"%PDF-1.7\n" + b"0" * 100
 
@@ -20,10 +20,11 @@ def _upload(aws, queue="retail", doc_id="d1", data=PDF):
     return {"document_id": doc_id, "bucket": "documents-bucket", "key": key}
 
 
-def _review(doc_id, approved=True, **extra):
-    body = {"approved": approved, "reviewer": "finops.user", **extra}
-    return submit_review.handler(
-        {"pathParameters": {"id": doc_id}, "body": json.dumps(body)}, None)
+def _review(doc_id, approved=True, user="asha", **extra):
+    body = {"approved": approved, **extra}
+    if not approved:
+        body.setdefault("reason", "not a valid invoice")
+    return reviews.handler(api_event("POST", "/reviews/{id}", doc_id, body, user=user), None)
 
 
 def test_upload_starts_one_workflow_even_if_event_is_redelivered(aws):
@@ -65,12 +66,14 @@ def test_low_confidence_document_waits_for_review_then_completes(aws):
     workflow.request_review({**state, "task_token": "tok-1"}, None)
     assert aws["repo"].get("d1")["status"] == "PENDING_REVIEW"
 
-    resp = _review("d1", corrected_fields={"TAX_PAYER_ID": "36AAAAA0000A1Z5"})
+    resp = _review("d1", corrected_fields={"TAX_PAYER_ID": "36ABCDE1234F1Z5"})
     assert resp["statusCode"] == 200
     item = aws["repo"].get("d1")
     assert item["status"] == "VALIDATED"
+    assert item["reviewed_by"] == "asha"
     assert item["fields"]["TAX_PAYER_ID"]["confidence"] == 100
     assert "review_task_token" not in item
+    assert "review_queue" not in item  # left the queue index
     assert aws["sfn"].task_success == [{"taskToken": "tok-1",
                                         "output": '{"approved": true}'}]
 
@@ -81,7 +84,7 @@ def test_second_review_submission_is_rejected(aws):
     workflow.request_review({**state, "task_token": "tok-1"}, None)
 
     assert _review("d1")["statusCode"] == 200
-    assert _review("d1", approved=False)["statusCode"] == 409
+    assert _review("d1", approved=False, user="ravi")["statusCode"] == 409
     assert len(aws["sfn"].task_success) == 1  # workflow resumed exactly once
 
 
@@ -106,6 +109,17 @@ def test_failure_handler_does_not_overwrite_terminal_state(aws):
     state = workflow.scan(_upload(aws, data=b"junk"), None)  # quarantined
     workflow.mark_failed({**state, "error": {"Error": "Boom"}}, None)
     assert aws["repo"].get("d1")["status"] == "QUARANTINED"
+
+
+def test_review_timeout_removes_document_from_queue(aws):
+    state = workflow.validate(workflow.extract(workflow.scan(
+        _upload(aws, queue="corporate"), None), None), None)
+    workflow.request_review({**state, "task_token": "tok-1"}, None)
+    assert len(aws["repo"].list_pending_review("corporate")) == 1
+
+    workflow.mark_failed({**state, "error": {"Error": "States.Timeout"}}, None)
+    assert aws["repo"].list_pending_review("corporate") == []
+    assert "review_task_token" not in aws["repo"].get("d1")
 
 
 def test_failure_handler_records_cause(aws):

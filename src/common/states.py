@@ -42,3 +42,9 @@ ALLOWED_FROM: dict[Status, frozenset[Status]] = {
 
 def can_transition(current: Status, target: Status) -> bool:
     return current in ALLOWED_FROM.get(target, frozenset())
+
+
+# Attributes that exist only while a document is in review. Removed whenever a
+# document leaves review, however it leaves (decision, timeout or failure), so
+# it also drops out of the sparse review-queue index.
+REVIEW_ATTRS = ("review_queue", "review_task_token", "claimed_by", "claim_expires_at")

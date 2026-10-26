@@ -4,6 +4,10 @@ Context flags (cdk.json or -c on the command line):
   extractor     "textract" (default) or "stub" for a zero-cost demo
   enableSearch  true to provision an OpenSearch Serverless collection
   ephemeral     true to let `cdk destroy` delete data (demo accounts only)
+  authDomainPrefix  Cognito sign-in domain prefix (default docreview-<account>)
+
+Build the reviewer app (`npm run build` in frontend/) before deploying; the
+stack publishes frontend/dist to the site bucket.
 """
 
 from __future__ import annotations
@@ -12,57 +16,53 @@ import json
 from pathlib import Path
 
 from aws_cdk import (
+    Annotations,
     CfnOutput,
     Duration,
     RemovalPolicy,
     Stack,
-)
-from aws_cdk import (
     aws_apigateway as apigw,
-)
-from aws_cdk import (
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
     aws_cloudwatch as cw,
-)
-from aws_cdk import (
+    aws_cognito as cognito,
     aws_dynamodb as ddb,
-)
-from aws_cdk import (
     aws_events as events,
-)
-from aws_cdk import (
     aws_iam as iam,
-)
-from aws_cdk import (
     aws_lambda as lambda_,
-)
-from aws_cdk import (
     aws_lambda_event_sources as sources,
-)
-from aws_cdk import (
     aws_logs as logs,
-)
-from aws_cdk import (
     aws_opensearchserverless as aoss,
-)
-from aws_cdk import (
     aws_s3 as s3,
-)
-from aws_cdk import (
+    aws_s3_deployment as s3deploy,
     aws_s3_notifications as s3n,
-)
-from aws_cdk import (
     aws_sqs as sqs,
-)
-from aws_cdk import (
     aws_stepfunctions as sfn,
-)
-from aws_cdk import (
     aws_stepfunctions_tasks as tasks,
 )
 from constructs import Construct
 
-SRC = str(Path(__file__).resolve().parent.parent / "src")
+ROOT = Path(__file__).resolve().parent.parent
+SRC = str(ROOT / "src")
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 SEARCH_COLLECTION = "doc-ingestion"
+REVIEWER_GROUP = "reviewers"
+LOCAL_DEV_URL = "http://localhost:5173/"
+
+# Same-origin app and API, so the policy can stay tight. Wildcards cover the
+# regional S3 endpoint used for document previews and the Cognito endpoints.
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https://*.amazonaws.com",
+    "frame-src https://*.amazonaws.com",
+    "connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
 
 
 class IngestionStack(Stack):
@@ -105,6 +105,17 @@ class IngestionStack(Stack):
             projection_type=ddb.ProjectionType.INCLUDE,
             non_key_attributes=["document_id"],
         )
+        # Sparse index: only documents carrying review_queue (set while they
+        # wait for a human) are in it, so listing the queue never scans.
+        table.add_global_secondary_index(
+            index_name="pending-review",
+            partition_key=ddb.Attribute(name="review_queue", type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="created_at", type=ddb.AttributeType.STRING),
+            projection_type=ddb.ProjectionType.INCLUDE,
+            # Never project review_task_token: it can resume the workflow.
+            non_key_attributes=["document_id", "business_queue", "review_issues",
+                                "possible_duplicate_of", "claimed_by", "claim_expires_at"],
+        )
 
         audit_table = ddb.Table(
             self, "AuditTable",
@@ -140,7 +151,8 @@ class IngestionStack(Stack):
         create_fn = fn("CreateDocumentFn", "handlers.create_document.handler",
                        env={"BUCKET_NAME": bucket.bucket_name})
         get_fn = fn("GetDocumentFn", "handlers.get_document.handler")
-        review_fn = fn("SubmitReviewFn", "handlers.submit_review.handler")
+        reviews_fn = fn("ReviewsFn", "handlers.reviews.handler",
+                        env={"BUCKET_NAME": bucket.bucket_name})
         scan_fn = fn("ScanFn", "handlers.workflow.scan")
         extract_fn = fn("ExtractFn", "handlers.workflow.extract", timeout=120, memory=512,
                         env={"EXTRACTOR": extractor})
@@ -150,7 +162,7 @@ class IngestionStack(Stack):
         mark_failed_fn = fn("MarkFailedFn", "handlers.workflow.mark_failed")
         on_created_fn = fn("OnObjectCreatedFn", "handlers.on_object_created.handler")
 
-        for f in (create_fn, review_fn, scan_fn, extract_fn, validate_fn,
+        for f in (create_fn, reviews_fn, scan_fn, extract_fn, validate_fn,
                   request_review_fn, finalize_fn, mark_failed_fn, on_created_fn):
             table.grant_read_write_data(f)
         table.grant_read_data(get_fn)
@@ -158,6 +170,7 @@ class IngestionStack(Stack):
         bucket.grant_put(create_fn)  # needed to presign the upload URL
         bucket.grant_read(scan_fn)
         bucket.grant_read(extract_fn)  # Textract reads S3 with the caller's role
+        bucket.grant_read(reviews_fn)  # presigned preview URLs
         extract_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["textract:AnalyzeExpense"], resources=["*"]))
         events.EventBus.from_event_bus_name(self, "DefaultBus", "default") \
@@ -230,7 +243,7 @@ class IngestionStack(Stack):
                 level=sfn.LogLevel.ERROR,
             ),
         )
-        state_machine.grant_task_response(review_fn)
+        state_machine.grant_task_response(reviews_fn)
         state_machine.grant_start_execution(on_created_fn)
         on_created_fn.add_environment("STATE_MACHINE_ARN", state_machine.state_machine_arn)
 
@@ -267,7 +280,11 @@ class IngestionStack(Stack):
         api = apigw.RestApi(
             self, "IngestionApi",
             rest_api_name="document-ingestion",
-            # Machine-to-machine callers sign requests with SigV4.
+            # Regional: CloudFront sits in front for the reviewer app, and
+            # system callers reach it directly.
+            endpoint_types=[apigw.EndpointType.REGIONAL],
+            # Machine-to-machine callers sign requests with SigV4. Human
+            # routes override this with the Cognito authorizer below.
             default_method_options=apigw.MethodOptions(
                 authorization_type=apigw.AuthorizationType.IAM),
             deploy_options=apigw.StageOptions(
@@ -286,7 +303,27 @@ class IngestionStack(Stack):
         documents.add_method("POST", apigw.LambdaIntegration(create_fn))
         doc = documents.add_resource("{id}")
         doc.add_method("GET", apigw.LambdaIntegration(get_fn))
-        doc.add_resource("review").add_method("POST", apigw.LambdaIntegration(review_fn))
+
+        # -- reviewers: web app, sign-in and the review API ------------------
+        site, distribution = self._add_reviewer_site(api)
+        app_url = f"https://{distribution.distribution_domain_name}/"
+        user_pool, user_pool_client, auth_domain = self._add_reviewer_auth(removal, app_url)
+        reviewer_auth = apigw.MethodOptions(
+            authorization_type=apigw.AuthorizationType.COGNITO,
+            authorizer=apigw.CognitoUserPoolsAuthorizer(
+                self, "ReviewerAuthorizer", cognito_user_pools=[user_pool]),
+        )
+        reviews_integration = apigw.LambdaIntegration(reviews_fn)
+        reviews_res = api.root.add_resource("reviews")
+        reviews_res.add_method("GET", reviews_integration, **_opts(reviewer_auth))
+        review = reviews_res.add_resource("{id}")
+        review.add_method("GET", reviews_integration, **_opts(reviewer_auth))
+        review.add_method("POST", reviews_integration, **_opts(reviewer_auth))
+        review.add_resource("claim").add_method("POST", reviews_integration, **_opts(reviewer_auth))
+        review.add_resource("release").add_method("POST", reviews_integration,
+                                                  **_opts(reviewer_auth))
+
+        self._publish_reviewer_app(site, distribution, user_pool, user_pool_client, auth_domain)
 
         # -- alarms ----------------------------------------------------------
         cw.Alarm(self, "WorkflowFailures",
@@ -307,6 +344,157 @@ class IngestionStack(Stack):
         CfnOutput(self, "TableName", value=table.table_name)
         CfnOutput(self, "AuditTableName", value=audit_table.table_name)
         CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
+        CfnOutput(self, "ReviewAppUrl", value=app_url)
+        CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
+        CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
+        CfnOutput(self, "AuthDomain", value=auth_domain.base_url())
+
+    # -- reviewer sign-in ----------------------------------------------------
+
+    def _add_reviewer_auth(self, removal: RemovalPolicy, app_url: str):
+        """Cognito user pool for people. Accounts are created by an admin (no
+        self sign-up); only members of the reviewers group can use the API."""
+        user_pool = cognito.UserPool(
+            self, "Reviewers",
+            self_sign_up_enabled=False,
+            sign_in_aliases=cognito.SignInAliases(email=True),
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True, mutable=False)),
+            mfa=cognito.Mfa.OPTIONAL,
+            mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
+            password_policy=cognito.PasswordPolicy(min_length=12),
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            removal_policy=removal,
+        )
+        cognito.CfnUserPoolGroup(
+            self, "ReviewerGroup", user_pool_id=user_pool.user_pool_id,
+            group_name=REVIEWER_GROUP,
+            description="Can work the document review queue")
+
+        prefix = self.node.try_get_context("authDomainPrefix") or f"docreview-{self.account}"
+        auth_domain = user_pool.add_domain(
+            "SignInDomain", cognito_domain=cognito.CognitoDomainOptions(domain_prefix=prefix))
+
+        callback_urls = [app_url, LOCAL_DEV_URL]
+
+        client = user_pool.add_client(
+            "ReviewApp",
+            generate_secret=False,  # browser app: authorization code + PKCE
+            o_auth=cognito.OAuthSettings(
+                flows=cognito.OAuthFlows(authorization_code_grant=True),
+                scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL,
+                        cognito.OAuthScope.PROFILE],
+                callback_urls=callback_urls,
+                logout_urls=callback_urls,
+            ),
+            supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
+            prevent_user_existence_errors=True,
+            id_token_validity=Duration.hours(1),
+            access_token_validity=Duration.hours(1),
+            refresh_token_validity=Duration.hours(12),  # one working day
+        )
+        return user_pool, client, auth_domain
+
+    # -- reviewer web app ----------------------------------------------------
+
+    def _add_reviewer_site(self, api: apigw.RestApi):
+        """S3 + CloudFront for the React app, with the review API routed
+        through the same distribution: one origin, so no CORS, and the API
+        stays behind the same TLS and security headers."""
+        site = s3.Bucket(
+            self, "ReviewAppSite",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            # Build output only: always safe to recreate.
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        headers = cloudfront.ResponseHeadersPolicy(
+            self, "SecurityHeaders",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=CONTENT_SECURITY_POLICY, override=True),
+                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                    access_control_max_age=Duration.days(365), include_subdomains=True,
+                    override=True),
+                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(override=True),
+                frame_options=cloudfront.ResponseHeadersFrameOptions(
+                    frame_option=cloudfront.HeadersFrameOption.DENY, override=True),
+                referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                    referrer_policy=cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+                    override=True),
+            ),
+        )
+
+        distribution = cloudfront.Distribution(
+            self, "ReviewApp",
+            default_root_object="index.html",
+            price_class=cloudfront.PriceClass.PRICE_CLASS_200,  # includes India
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3BucketOrigin.with_origin_access_control(site),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                response_headers_policy=headers,
+                compress=True,
+            ),
+            additional_behaviors={
+                "/reviews*": cloudfront.BehaviorOptions(
+                    origin=origins.RestApiOrigin(api),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    # Never cache API responses; forward the Authorization
+                    # header so the Cognito authorizer sees the token.
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=(
+                        cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER),
+                    response_headers_policy=headers,
+                ),
+            },
+        )
+        return site, distribution
+
+    def _publish_reviewer_app(self, site: s3.Bucket, distribution: cloudfront.Distribution,
+                              user_pool: cognito.UserPool, client: cognito.UserPoolClient,
+                              auth_domain: cognito.UserPoolDomain) -> None:
+        if not (FRONTEND_DIST / "index.html").exists():
+            Annotations.of(self).add_warning(
+                "frontend/dist not found: the reviewer app will not be published. "
+                "Run `npm ci && npm run build` in frontend/ before `cdk deploy`.")
+            return
+
+        # Hashed assets are immutable and cached for a year. index.html and
+        # config.json must always be fresh, so they go in a second deployment
+        # with no-cache. prune=False on both so they don't delete each
+        # other's files (old hashed assets also keep open tabs working).
+        assets = s3deploy.BucketDeployment(
+            self, "ReviewAppAssets",
+            destination_bucket=site,
+            sources=[s3deploy.Source.asset(
+                str(FRONTEND_DIST), exclude=["index.html", "config*.json"])],
+            cache_control=[s3deploy.CacheControl.from_string(
+                "public, max-age=31536000, immutable")],
+            prune=False,
+        )
+        entry = s3deploy.BucketDeployment(
+            self, "ReviewAppEntry",
+            destination_bucket=site,
+            sources=[
+                s3deploy.Source.data("index.html", (FRONTEND_DIST / "index.html").read_text()),
+                s3deploy.Source.json_data("config.json", {
+                    "region": self.region,
+                    "userPoolId": user_pool.user_pool_id,
+                    "userPoolClientId": client.user_pool_client_id,
+                    "authDomain": auth_domain.base_url(),
+                    "apiBaseUrl": "",
+                }),
+            ],
+            cache_control=[s3deploy.CacheControl.no_cache()],
+            prune=False,
+            distribution=distribution,
+            distribution_paths=["/index.html", "/config.json"],
+        )
+        entry.node.add_dependency(assets)
 
     def _add_search(self, stream_fn: lambda_.Function) -> None:
         enc = aoss.CfnSecurityPolicy(
@@ -343,3 +531,7 @@ class IngestionStack(Stack):
             actions=["aoss:APIAccessAll"], resources=[collection.attr_arn]))
         stream_fn.add_environment("SEARCH_ENDPOINT", collection.attr_collection_endpoint)
         CfnOutput(self, "SearchEndpoint", value=collection.attr_collection_endpoint)
+
+
+def _opts(options: apigw.MethodOptions) -> dict:
+    return {"authorization_type": options.authorization_type, "authorizer": options.authorizer}

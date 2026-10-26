@@ -9,12 +9,16 @@ cannot both win: the loser gets ``ConcurrencyError`` and re-reads.
 This deliberately does not use DynamoDB's multi-item TransactWriteItems API:
 contention here is on one item, so a conditional write is cheaper, simpler,
 and sufficient.
+
+Reviewer claims are short leases on a document in PENDING_REVIEW. They stop
+two reviewers from working the same document; the version check still decides
+who wins if they race anyway.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from boto3.dynamodb.conditions import Key
@@ -23,6 +27,7 @@ from botocore.exceptions import ClientError
 from common.states import ALLOWED_FROM, Status
 
 HASH_INDEX = "by-content-hash"
+REVIEW_INDEX = "pending-review"
 
 
 class DocumentNotFound(Exception):
@@ -41,8 +46,20 @@ class InvalidTransition(Exception):
     """The record is not in a state this transition may start from."""
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds")
+class ClaimConflict(Exception):
+    """Another reviewer holds a live claim on the document."""
+
+    def __init__(self, document_id: str, holder: str | None):
+        super().__init__(f"{document_id} is claimed by {holder}")
+        self.holder = holder
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _iso(moment: datetime) -> str:
+    return moment.isoformat(timespec="milliseconds")
 
 
 def _pk(document_id: str) -> str:
@@ -50,7 +67,7 @@ def _pk(document_id: str) -> str:
 
 
 class DocumentRepository:
-    def __init__(self, table: Any, clock: Callable[[], str] = _utc_now):
+    def __init__(self, table: Any, clock: Callable[[], datetime] = _utc_now):
         self._table = table
         self._clock = clock
 
@@ -71,6 +88,18 @@ class DocumentRepository:
         )
         return resp.get("Items", [])
 
+    def list_pending_review(self, business_queue: str, limit: int = 100) -> list[dict]:
+        """Oldest first, so the queue is worked in arrival order. The index is
+        sparse: only records carrying ``review_queue`` (set while a document is
+        PENDING_REVIEW) appear in it."""
+        resp = self._table.query(
+            IndexName=REVIEW_INDEX,
+            KeyConditionExpression=Key("review_queue").eq(business_queue),
+            ScanIndexForward=True,
+            Limit=limit,
+        )
+        return resp.get("Items", [])
+
     # -- writes --------------------------------------------------------------
 
     def create(
@@ -81,7 +110,7 @@ class DocumentRepository:
         content_sha256: str | None = None,
         source: str = "api",
     ) -> dict:
-        now = self._clock()
+        now = _iso(self._clock())
         item: dict[str, Any] = {
             "pk": _pk(document_id),
             "sk": "META",
@@ -122,14 +151,18 @@ class DocumentRepository:
         expected_version: int,
         set_attrs: dict[str, Any] | None = None,
         remove_attrs: tuple[str, ...] = (),
+        claimable_by: str | None = None,
     ) -> dict:
+        """``claimable_by``: also require that no *other* reviewer holds a
+        live claim, checked atomically with the write."""
         allowed_from = sorted(s.value for s in ALLOWED_FROM[to_status])
+        now = self._clock()
         names = {"#status": "status", "#version": "version"}
         values: dict[str, Any] = {
             ":to": to_status.value,
             ":expected": expected_version,
             ":one": 1,
-            ":now": self._clock(),
+            ":now": _iso(now),
         }
         sets = ["#status = :to", "#version = #version + :one", "updated_at = :now"]
         for i, (attr, value) in enumerate((set_attrs or {}).items()):
@@ -148,15 +181,22 @@ class DocumentRepository:
                 names[f"#r{i}"] = attr
             update += " REMOVE " + ", ".join(f"#r{i}" for i in range(len(remove_attrs)))
 
+        condition = (
+            "#version = :expected AND #status IN (" + ", ".join(from_placeholders) + ")"
+        )
+        if claimable_by is not None:
+            names["#claimed_by"] = "claimed_by"
+            values[":me"] = claimable_by
+            condition += (
+                " AND (attribute_not_exists(#claimed_by) OR #claimed_by = :me"
+                " OR claim_expires_at < :now)"
+            )
+
         try:
             resp = self._table.update_item(
                 Key={"pk": _pk(document_id), "sk": "META"},
                 UpdateExpression=update,
-                ConditionExpression=(
-                    "#version = :expected AND #status IN ("
-                    + ", ".join(from_placeholders)
-                    + ")"
-                ),
+                ConditionExpression=condition,
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,
                 ReturnValues="ALL_NEW",
@@ -164,11 +204,67 @@ class DocumentRepository:
         except ClientError as err:
             if not _is_conditional_failure(err):
                 raise
-            self._raise_specific_failure(document_id, to_status, expected_version)
+            self._raise_specific_failure(document_id, to_status, expected_version, now)
         return resp["Attributes"]
 
+    def claim(self, document_id: str, reviewer: str, ttl: timedelta) -> dict:
+        """Take (or renew) a review lease. Succeeds if the document is awaiting
+        review and is unclaimed, already ours, or held by an expired lease."""
+        now = self._clock()
+        try:
+            resp = self._table.update_item(
+                Key={"pk": _pk(document_id), "sk": "META"},
+                UpdateExpression=(
+                    "SET claimed_by = :me, claim_expires_at = :until,"
+                    " #version = #version + :one, updated_at = :now"
+                ),
+                ConditionExpression=(
+                    "#status = :pending AND (attribute_not_exists(claimed_by)"
+                    " OR claimed_by = :me OR claim_expires_at < :now)"
+                ),
+                ExpressionAttributeNames={"#status": "status", "#version": "version"},
+                ExpressionAttributeValues={
+                    ":me": reviewer,
+                    ":until": _iso(now + ttl),
+                    ":now": _iso(now),
+                    ":one": 1,
+                    ":pending": Status.PENDING_REVIEW.value,
+                },
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as err:
+            if not _is_conditional_failure(err):
+                raise
+            current = self.get(document_id)
+            if current["status"] != Status.PENDING_REVIEW.value:
+                raise InvalidTransition(
+                    f"{document_id} is {current['status']}, not awaiting review"
+                ) from err
+            raise ClaimConflict(document_id, current.get("claimed_by")) from err
+        return resp["Attributes"]
+
+    def release_claim(self, document_id: str, reviewer: str) -> bool:
+        """Give a lease back early. Returns False if we did not hold it."""
+        try:
+            self._table.update_item(
+                Key={"pk": _pk(document_id), "sk": "META"},
+                UpdateExpression=(
+                    "REMOVE claimed_by, claim_expires_at"
+                    " SET #version = #version + :one, updated_at = :now"
+                ),
+                ConditionExpression="claimed_by = :me",
+                ExpressionAttributeNames={"#version": "version"},
+                ExpressionAttributeValues={
+                    ":me": reviewer, ":one": 1, ":now": _iso(self._clock())},
+            )
+        except ClientError as err:
+            if _is_conditional_failure(err):
+                return False
+            raise
+        return True
+
     def _raise_specific_failure(
-        self, document_id: str, to_status: Status, expected_version: int
+        self, document_id: str, to_status: Status, expected_version: int, now: datetime
     ) -> None:
         """Re-read after a failed condition so callers can react correctly:
         a stale version means retry with fresh state; a bad state does not."""
@@ -178,6 +274,9 @@ class DocumentRepository:
                 f"{document_id}: expected version {expected_version}, "
                 f"found {current['version']}"
             )
+        if Status(current["status"]) in ALLOWED_FROM[to_status]:
+            # Version and state matched, so the claim condition failed.
+            raise ClaimConflict(document_id, current.get("claimed_by"))
         raise InvalidTransition(
             f"{document_id}: cannot move {current['status']} -> {to_status.value}"
         )

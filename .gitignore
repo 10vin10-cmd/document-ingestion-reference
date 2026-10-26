@@ -6,3 +6,10 @@ __pycache__/
 cdk.out/
 cdk.context.json
 .env
+
+# reviewer app
+frontend/node_modules/
+frontend/dist/
+frontend/dist-demo/
+frontend/public/config.json
+frontend/*.tsbuildinfo
